@@ -1,0 +1,7 @@
+Django==6.0.7
+python-dotenv
+psycopg2-binary
+psycopg2-binary==2.9.12
+python-dotenv==1.0.0
+djangorestframework-simplejwt==5.5.1
+neo4j==6.2.0
