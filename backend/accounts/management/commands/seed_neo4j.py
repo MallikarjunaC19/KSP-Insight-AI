@@ -1,5 +1,13 @@
 """
 KSP Insight AI — Seed the Neo4j graph from PostgreSQL data
+Location: accounts/management/commands/seed_neo4j.py
+
+Usage:
+    python manage.py seed_neo4j
+
+Run this AFTER `python manage.py seed_data` — it reads Person, Vehicle,
+InvestigationCase, VehicleOwnership, and PersonCaseRole from PostgreSQL
+and mirrors the relevant entities/relationships into Neo4j.
 
 Nodes created:
     Person(id, name)
@@ -14,6 +22,13 @@ Relationships created:
     (Person)-[:COMPLAINANT_IN]->(Case)       from PersonCaseRole role=COMPLAINANT
     (Person)-[:ASSOCIATED_WITH]->(Person)    derived: people linked to the same case
 
+Note: Postgres UUIDs are stored as the Neo4j node's `pg_id` property,
+so you can always join back to the source-of-truth record in Postgres
+by that ID — Neo4j only stores what's needed for graph traversal
+(names, labels, relationship types), not full record details.
+
+Idempotent: uses MERGE (Cypher's get-or-create) throughout, safe to
+re-run after adding more Postgres data.
 """
 
 from django.core.management.base import BaseCommand
@@ -84,15 +99,20 @@ class Command(BaseCommand):
             )
 
     def seed_case_nodes(self, session):
-        for case in InvestigationCase.objects.all():
+        for case in InvestigationCase.objects.select_related("fir__police_station"):
             session.run(
                 """
                 MERGE (c:InvestigationCase {pg_id: $pg_id})
-                SET c.case_number = $case_number, c.status = $status
+                SET c.case_number = $case_number,
+                    c.status = $status,
+                    c.station_code = $station_code,
+                    c.district = $district
                 """,
                 pg_id=str(case.id),
                 case_number=case.case_number,
                 status=case.status,
+                station_code=case.fir.police_station.code,
+                district=case.fir.police_station.district,
             )
 
     def seed_ownership_relationships(self, session):
@@ -125,14 +145,27 @@ class Command(BaseCommand):
     def seed_associated_with(self, session):
         """
         Two people sharing the same InvestigationCase are considered
-        associated 
-        
+        associated. Each relationship carries the case that created it
+        (case_pg_id, station_code, district) — this is what lets
+        graph_lookup templates filter out associations derived from a
+        case outside the asking officer's scope, rather than exposing
+        a bare "these two people are connected" fact with no way to
+        check whether the officer is allowed to know why.
+
+        MERGE keys on (person1, person2, case_pg_id) so two people who
+        share multiple cases get one relationship per case, not a
+        single relationship that collapses/loses the scope of either.
         """
-        session.run(
-            """
-            MATCH (c:InvestigationCase)<-[]-(p1:Person)
-            MATCH (c)<-[]-(p2:Person)
-            WHERE p1.pg_id < p2.pg_id
-            MERGE (p1)-[:ASSOCIATED_WITH]->(p2)
-            """
-        )
+        for case in InvestigationCase.objects.select_related("fir__police_station"):
+            session.run(
+                """
+                MATCH (c:InvestigationCase {pg_id: $case_pg_id})<-[]-(p1:Person)
+                MATCH (c)<-[]-(p2:Person)
+                WHERE p1.pg_id < p2.pg_id
+                MERGE (p1)-[r:ASSOCIATED_WITH {case_pg_id: $case_pg_id}]->(p2)
+                SET r.station_code = $station_code, r.district = $district
+                """,
+                case_pg_id=str(case.id),
+                station_code=case.fir.police_station.code,
+                district=case.fir.police_station.district,
+            )
