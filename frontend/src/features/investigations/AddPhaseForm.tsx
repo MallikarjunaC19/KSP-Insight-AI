@@ -48,7 +48,7 @@ export function AddPhaseForm({ caseId }: { caseId: string }) {
         <form onSubmit={handleSubmit((v) => mutation.mutate(v))} className="space-y-3">
           <div>
             <Label>Officer</Label>
-            <Select value={selectedOfficer} onValueChange={(v) => setValue('officer', v, { shouldValidate: true })}>
+            <Select value={selectedOfficer} onValueChange={(v) => setValue('officer', v ?? '', { shouldValidate: true })}>
               <SelectTrigger><SelectValue placeholder="Select officer" /></SelectTrigger>
               <SelectContent>
                 {officers?.map((o) => (

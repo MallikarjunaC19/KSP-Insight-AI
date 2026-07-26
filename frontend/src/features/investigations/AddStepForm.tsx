@@ -49,7 +49,7 @@ export function AddStepForm({ investigationId }: { investigationId: string }) {
         <form onSubmit={handleSubmit((v) => mutation.mutate(v))} className="space-y-3">
           <div>
             <Label>Performed By</Label>
-            <Select value={selectedOfficer} onValueChange={(v) => setValue('performed_by', v, { shouldValidate: true })}>
+            <Select value={selectedOfficer} onValueChange={(v) => setValue('performed_by', v ?? '', { shouldValidate: true })}>
               <SelectTrigger><SelectValue placeholder="Select officer" /></SelectTrigger>
               <SelectContent>
                 {officers?.map((o) => (

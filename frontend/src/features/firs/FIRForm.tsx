@@ -89,7 +89,7 @@ export function FIRForm({ existingFIR, onSuccess }: FIRFormProps) {
 
       <div>
         <Label>Police Station</Label>
-        <Select value={selectedStation} onValueChange={(v) => setValue('police_station', v, { shouldValidate: true })}>
+        <Select value={selectedStation} onValueChange={(v) => setValue('police_station', v ?? '', { shouldValidate: true })}>
           <SelectTrigger><SelectValue placeholder="Select station" /></SelectTrigger>
           <SelectContent>
             {stations?.map((s) => (

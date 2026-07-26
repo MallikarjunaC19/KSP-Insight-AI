@@ -18,10 +18,7 @@ import { AuditLogPage } from '../features/audit-log/AuditLogPage'
 import { ProfilePage } from '../features/profile/ProfilePage'
 import { AdministrationPage } from '../features/administration/AdministrationPage'
 import { OfficerDetailPage } from '../features/administration/OfficerDetailPage'
-// Placeholder pages until we build each module properly
-function Placeholder({ name }: { name: string }) {
-  return <h1 className="text-2xl font-bold">{name}</h1>
-}
+
 
 export const router = createBrowserRouter([
   {

@@ -74,7 +74,7 @@ export function CrimeForm({ existingCrime, onSuccess }: CrimeFormProps) {
     <form onSubmit={handleSubmit((values) => mutation.mutate(values))} className="space-y-4 max-w-lg">
       <div>
         <Label>Category</Label>
-        <Select value={selectedCategory} onValueChange={(v) => setValue('category', v, { shouldValidate: true })}>
+        <Select value={selectedCategory} onValueChange={(v) => setValue('category', v ?? '', { shouldValidate: true })}>
           <SelectTrigger><SelectValue placeholder="Select category" /></SelectTrigger>
           <SelectContent>
             {categories?.map((c) => (
@@ -87,7 +87,7 @@ export function CrimeForm({ existingCrime, onSuccess }: CrimeFormProps) {
 
       <div>
         <Label>Police Station</Label>
-        <Select value={selectedStation} onValueChange={(v) => setValue('police_station', v, { shouldValidate: true })}>
+        <Select value={selectedStation} onValueChange={(v) => setValue('police_station', v ?? '', { shouldValidate: true })}>
           <SelectTrigger><SelectValue placeholder="Select station" /></SelectTrigger>
           <SelectContent>
             {stations?.map((s) => (
