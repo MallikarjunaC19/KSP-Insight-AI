@@ -31,20 +31,23 @@ SECRET_KEY = 'django-insecure-y9af2x-clnce44rh7x-2lo12=n54nizq=ys_!k-o@q83d=idpc
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = [ "localhost",
-    "127.0.0.1",
-    "testserver",]
+ALLOWED_HOSTS = [ 
+        "127.0.0.1",
+    "localhost",
+    "gristle-marsupial-stammer.ngrok-free.dev",
+    ]
 
 
 # Application definition
 
 INSTALLED_APPS = [
-    'django.contrib.admin',
+   'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'rest_framework',
     'accounts',
     'crimes',
     'investigations',
@@ -158,7 +161,8 @@ SIMPLE_JWT = {
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
-    "http://127.0.0.1:5173",
+    "https://ksp-insight-ai-mkaxcmzi.onslate.in",
+    "https://ksp-insight-ai-nyfs-zmxnkjzm.onslate.in",
 ]
 
 CORS_ALLOW_CREDENTIALS = True

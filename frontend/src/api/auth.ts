@@ -19,7 +19,10 @@ export async function login(username: string, password: string): Promise<LoginRe
 
 export async function fetchMe(accessToken: string) {
   const res = await fetch(`${BASE_URL}/api/officers/me/`, {
-    headers: { Authorization: `Bearer ${accessToken}` },
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'ngrok-skip-browser-warning': 'true',
+    },
   })
   if (!res.ok) throw new Error('Failed to fetch officer profile')
   return res.json()
