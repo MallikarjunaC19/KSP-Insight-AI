@@ -140,13 +140,24 @@ def _inject_into_select(select_node: exp.Select, officer, condition: str) -> Non
     in this Select's FROM/JOIN (not recursing into nested subqueries —
     those get handled by the caller iterating over ALL Select nodes)."""
     tables = []
-    from_clause = select_node.args.get("from")
+    # NOTE: the installed sqlglot version stores the FROM clause under
+    # the args key "from_" (trailing underscore), NOT "from". Using the
+    # wrong key here silently returned None for every single query,
+    # which meant the base FROM-clause table was NEVER scoped — only
+    # tables written as an explicit JOIN were (those use the "joins"
+    # key, which didn't change). That was a live RBAC bypass: any query
+    # shaped like "FROM investigation_case ic JOIN arrest a ON ..." with
+    # no independently-scoped JOIN table ran completely unfiltered for
+    # every officer. Checking both keys so this also survives a
+    # sqlglot version that goes back to "from".
+    from_clause = select_node.args.get("from_") or select_node.args.get("from")
     if from_clause is not None:
         tables.append(from_clause.this)
     for join in select_node.args.get("joins", []) or []:
         tables.append(join.this)
 
     seen_aliases = set()
+    scoped_table_names = set()
     for t in tables:
         if not isinstance(t, exp.Table):
             continue  # skip joined subqueries/CTEs here — they're Select nodes handled separately
@@ -159,8 +170,27 @@ def _inject_into_select(select_node: exp.Select, officer, condition: str) -> Non
                 f"Table '{table_name}' referenced more than once with ambiguous aliasing — refusing to guess scope."
             )
         seen_aliases.add(alias)
+        scoped_table_names.add(table_name)
         exists_clause = SCOPE_TABLE_TEMPLATES[table_name].format(alias=alias, cond=condition)
         select_node.where(exists_clause, copy=False)
+
+    # Fail-closed verification: re-check that every scoped table we
+    # found actually got an EXISTS clause attached, rather than trusting
+    # that the injection loop above worked. This is deliberately
+    # redundant with the loop itself — it exists specifically so that a
+    # *future* sqlglot args-key change (or any other silent mismatch
+    # between "what we think we scoped" and "what actually got scoped")
+    # produces a loud UnsafeQueryError instead of a silent unfiltered
+    # query. Cheap string count, not a full re-parse, since this is a
+    # last-resort safety net, not the primary mechanism.
+    where_clause = select_node.args.get("where")
+    where_sql = where_clause.sql() if where_clause is not None else ""
+    injected_count = where_sql.count("EXISTS")
+    if injected_count < len(scoped_table_names):
+        raise UnsafeQueryError(
+            "Could not confirm RBAC scoping was applied to every restricted "
+            "table in this query — refusing to execute."
+        )
 
 
 def validate_and_scope(sql: str, officer) -> str:
@@ -175,7 +205,17 @@ def validate_and_scope(sql: str, officer) -> str:
         return parsed.sql(dialect="postgres")  # DGP / SCRB Analyst — no injection needed
 
     condition = build_station_condition(officer)
-    for select_node in parsed.find_all(exp.Select):
+    # Materialize the list of Select nodes BEFORE injecting anything.
+    # find_all() is a generator walking the live tree; _inject_into_select()
+    # grafts new subqueries onto that tree (the EXISTS(...) templates),
+    # and those templates themselves reference scoped table names (e.g.
+    # "fir f_sc"). If the generator is still running while we mutate the
+    # tree, it discovers and re-scopes the subqueries we just injected,
+    # producing redundant nested EXISTS clauses — harmless here since it
+    # only adds restriction, but it's undefined-order behavior that isn't
+    # guaranteed to stay merely redundant for other query shapes.
+    select_nodes = list(parsed.find_all(exp.Select))
+    for select_node in select_nodes:
         _inject_into_select(select_node, officer, condition)
 
     return parsed.sql(dialect="postgres")

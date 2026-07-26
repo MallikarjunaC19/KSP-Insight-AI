@@ -1,4 +1,3 @@
-from django.shortcuts import render
 """
 KSP Insight AI — DRF Views
 App: accounts
@@ -7,7 +6,7 @@ Officer is the only viewset that touches RBAC scope filtering, using
 the same filter_by_station_field() the admin mixin uses. Master data
 viewsets are plain ReadOnlyModelViewSet + write-gated permission.
 """
- 
+from django.shortcuts import render
 from rest_framework import viewsets
 from rest_framework.exceptions import PermissionDenied
  
@@ -22,7 +21,20 @@ from accounts.api_permissions import (
 from accounts.permissions import (
     filter_by_station_field, is_state_scoped, is_district_scoped, is_station_scoped,
 )
- 
+
+from rest_framework.views import APIView
+from rest_framework.permissions import IsAuthenticated
+
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from rest_framework.response import Response
+
+COOKIE_KWARGS = dict(
+    httponly=True,
+    secure=False,       # dev only — set True once you're on HTTPS
+    samesite="None",    # dev only, cross-machine — see note below
+    path="/api/auth/",
+)
  
 class RoleViewSet(viewsets.ModelViewSet):
     queryset = Role.objects.all()
@@ -123,4 +135,35 @@ class OfficerViewSet(viewsets.ModelViewSet):
                 raise PermissionDenied("Cannot move an officer outside your own station.")
  
         serializer.save()
- 
+
+class CookieTokenObtainPairView(TokenObtainPairView):
+    def finalize_response(self, request, response, *args, **kwargs):
+        if response.status_code == 200 and "refresh" in response.data:
+            refresh = response.data.pop("refresh")
+            response.set_cookie("refresh_token", refresh, **COOKIE_KWARGS)
+        return super().finalize_response(request, response, *args, **kwargs)
+
+
+class CookieTokenRefreshView(TokenRefreshView):
+    def post(self, request, *args, **kwargs):
+        refresh = request.COOKIES.get("refresh_token")
+        if not refresh:
+            return Response({"detail": "No refresh token cookie."}, status=401)
+        request.data["refresh"] = refresh
+        response = super().post(request, *args, **kwargs)
+        if response.status_code == 200 and "refresh" in response.data:
+            new_refresh = response.data.pop("refresh")
+            response.set_cookie("refresh_token", new_refresh, **COOKIE_KWARGS)
+        return response
+
+
+class OfficerMeView(APIView):
+    """Resolves the current officer server-side from the authenticated
+    request — never from a client-supplied ID."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        officer = get_officer(request)
+        if officer is None:
+            return Response({"detail": "No officer profile for this user."}, status=404)
+        return Response(OfficerSerializer(officer).data)

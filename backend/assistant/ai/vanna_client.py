@@ -1,56 +1,76 @@
 """
 KSP Insight AI (KAVACH AI) — Vanna Client
-App: assistant / ai
 
-Uses Vanna's LEGACY (pre-2.0) mixin API deliberately — see the note in
-chat about why: Vanna 2.0 is its own full agent framework, and we
-already have one (the LangChain orchestrator). We only want Vanna's
-text-to-SQL generation, nothing else, so this wraps just that.
+Uses Vanna's legacy (<2.0) mixin API with Groq as the LLM provider.
+Only generate_sql() is used. All generated SQL is validated and scoped
+(see assistant/ai/sql_scope.py) before execution — Vanna's output is
+never trusted or run directly.
 
-We NEVER call vn.ask() or vn.run_sql() here — only vn.generate_sql().
-The generated SQL is untrusted output; it gets passed to
-assistant/ai/sql_scope.py's validate_and_scope() before anything
-touches the real database. See tools.py's security contract.
-
-pip install "vanna<2.0" chromadb groq
+Reverted from a Gemini-based version back to Groq — Groq's message
+format (list of {"role", "content"} dicts) maps directly onto its
+chat.completions.create(messages=...) call, so submit_prompt() here is
+simpler than the Gemini version's flatten-to-string approach.
 """
 
 import os
+from pathlib import Path
 
+from dotenv import load_dotenv
 from vanna.chromadb import ChromaDB_VectorStore
 from vanna.base import VannaBase
 from groq import Groq
 
+load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
+
+
+def _create_groq_client(api_key: str):
+    return Groq(api_key=api_key)
+
 
 class _GroqLLM(VannaBase):
-    """Legacy Vanna's documented pattern for plugging in a custom LLM —
-    implement system_message/user_message/assistant_message/submit_prompt,
-    same shape as their own mistral.py reference implementation."""
+    """
+    Groq implementation for Vanna — legacy mixin "bring your own LLM"
+    pattern (implement system_message/user_message/assistant_message/
+    submit_prompt, matching Vanna's own reference implementations).
+    """
 
     def __init__(self, config=None):
-        VannaBase.__init__(self, config=config)
-        self.client = Groq(api_key=(config or {}).get("api_key") or os.environ["GROQ_API_KEY"])
-        self.model = (config or {}).get("model", "openai/gpt-oss-120b")
+        super().__init__(config=config)
 
-    def system_message(self, message: str) -> dict:
+        config = config or {}
+
+        api_key = config.get("api_key") or os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GROQ_API_KEY is not configured. Set it in backend/.env."
+            )
+
+        self.client = _create_groq_client(api_key)
+        self.model_name = config.get(
+            "model",
+            os.getenv("VANNA_GROQ_MODEL", "openai/gpt-oss-120b"),
+        )
+
+    def system_message(self, message: str):
         return {"role": "system", "content": message}
 
-    def user_message(self, message: str) -> dict:
+    def user_message(self, message: str):
         return {"role": "user", "content": message}
 
-    def assistant_message(self, message: str) -> dict:
+    def assistant_message(self, message: str):
         return {"role": "assistant", "content": message}
 
     def submit_prompt(self, prompt, **kwargs) -> str:
         response = self.client.chat.completions.create(
-            model=self.model,
-            messages=prompt,
+            model=self.model_name,
+            messages=prompt,  # already [{"role": ..., "content": ...}, ...] — Groq takes this directly
             temperature=0.0,  # SQL generation should be deterministic, not creative
         )
-        return response.choices[0].message.content
+        return response.choices[0].message.content.strip()
 
 
 class KavachVanna(ChromaDB_VectorStore, _GroqLLM):
+
     def __init__(self, config=None):
         ChromaDB_VectorStore.__init__(self, config=config)
         _GroqLLM.__init__(self, config=config)
@@ -60,14 +80,20 @@ _instance = None
 
 
 def get_vanna() -> KavachVanna:
-    """Singleton — avoids reloading the ChromaDB collection on every
-    call. persist_directory should be a real path on disk that survives
-    restarts; train_vanna.py (management command) writes to the same
-    path so training persists across server restarts."""
     global _instance
+
     if _instance is None:
-        _instance = KavachVanna(config={
-            "path": os.environ.get("VANNA_CHROMA_PATH", "./vanna_chroma_store"),
-            "model": os.environ.get("VANNA_GROQ_MODEL", "openai/gpt-oss-120b"),
-        })
+        _instance = KavachVanna(
+            config={
+                "path": os.getenv(
+                    "VANNA_CHROMA_PATH",
+                    "./vanna_chroma_store",
+                ),
+                "model": os.getenv(
+                    "VANNA_GROQ_MODEL",
+                    "openai/gpt-oss-120b",
+                ),
+            }
+        )
+
     return _instance

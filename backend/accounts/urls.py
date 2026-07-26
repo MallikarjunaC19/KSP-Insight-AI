@@ -19,13 +19,20 @@ This gives you:
     /api/police-stations/
     /api/officers/
 (plus /{id}/ detail routes for each, courtesy of DefaultRouter)
+
+    /api/auth/token/
+    /api/auth/token/refresh/
+    /api/officers/me/
 """
 
+from django.urls import path
 from rest_framework.routers import DefaultRouter
 from accounts.views import (
     RoleViewSet, DepartmentViewSet, RankViewSet,
     PoliceStationViewSet, OfficerViewSet,
 )
+
+from .views import CookieTokenObtainPairView, CookieTokenRefreshView, OfficerMeView
 
 router = DefaultRouter()
 router.register("roles", RoleViewSet, basename="role")
@@ -34,4 +41,10 @@ router.register("ranks", RankViewSet, basename="rank")
 router.register("police-stations", PoliceStationViewSet, basename="police-station")
 router.register("officers", OfficerViewSet, basename="officer")
 
-urlpatterns = router.urls
+urlpatterns = [
+    path("auth/token/", CookieTokenObtainPairView.as_view()),
+    path("auth/token/refresh/", CookieTokenRefreshView.as_view()),
+    path("officers/me/", OfficerMeView.as_view()),
+] + router.urls
+
+

@@ -2,18 +2,7 @@
 KSP Insight AI — Zoho Catalyst QuickML client
 Location: assistant/ai/quickml_client.py
 
-UPDATED: added the `soid` parameter to the client_credentials token
-request. Per Zoho's own OAuth docs, `soid` is required for apps that
-support multiple orgs/portals — Catalyst does (you have a
-CATALYST_ORG_ID), so this was almost certainly the first error you'd
-have hit (a "missing_org_info" exception). Format is
-{servicename}.{org_id} — "ZohoCatalyst" is the standard naming pattern
-other Zoho products follow (ZohoCRM, ZohoRecruit, etc.) but isn't
-independently confirmed for Catalyst specifically. If this exact value
-throws a 400, check your Self Client's scope detail page in the API
-console for the exact service name it expects.
-
-Required in .env (unchanged):
+Required in .env:
     CATALYST_ORG_ID=...
     ZOHO_CLIENT_ID=...
     ZOHO_CLIENT_SECRET=...
@@ -59,13 +48,12 @@ def _get_access_token() -> str:
         )
 
     response = requests.post(
-        "https://accounts.zoho.in/oauth/v2/token",  # India DC — matches api.catalyst.zoho.in
+        "https://accounts.zoho.in/oauth/v2/token",
         params={
             "client_id": client_id,
             "client_secret": client_secret,
             "grant_type": "client_credentials",
             "scope": scope,
-            # See module docstring — required for multi-org apps like Catalyst.
             "soid": f"ZohoCatalyst.{org_id}",
         },
         timeout=15,
@@ -82,11 +70,10 @@ def predict(model_key: str, features: dict) -> dict:
     """
     model_key: one of "severity", "solvability", "priority", "hotspot"
     features: dict of column_name -> value, matching the columns the
-              model was trained on (see the per-model CSV column lists
-              from the dataset generator).
+              model was trained on.
 
-    Returns the raw classification_result dict from Catalyst, e.g.
-        {"Low": 5, "Medium": 70, "High": 20, "Critical": 5}   (percentages)
+    Returns the raw response dict from Catalyst, e.g.
+        {"result": ["High"], "likelihood_score": [0.51], "explanation": {...}, "status": "success"}
     """
     if model_key not in MODEL_ENV_PREFIXES:
         raise ValueError(f"Unknown model_key '{model_key}', expected one of {list(MODEL_ENV_PREFIXES)}")
@@ -110,7 +97,9 @@ def predict(model_key: str, features: dict) -> dict:
             "X-QUICKML-ENDPOINT-KEY": endpoint_key,
             "Authorization": f"Zoho-oauthtoken {access_token}",
             "CATALYST-ORG": org_id,
-            "Environment": "Development",  # switch to "Production" once demo-ready
+            # Confirmed via isolated testing: "Development" + explainModel=true
+            # intermittently 500s. Production handles the same request reliably.
+            "Environment": "Production",
         },
         timeout=20,
     )

@@ -2,28 +2,35 @@
 KSP Insight AI (KAVACH AI) — Assistant AI Tools
 App: assistant / ai
 
-CONSOLIDATED VERSION — all four real tool implementations in one file,
-to eliminate the splice-drift that caused quickml's stub to stay active
-even after quickml_client.py was updated. This is now the single
-authoritative version of tools.py.
+CONSOLIDATED VERSION — reverted from Gemini back to Groq across every
+tool. bhashini (Sarvam AI) is untouched by this — Sarvam is a separate
+translation/TTS provider, unrelated to which LLM does reasoning.
 
 Status:
-  sql_lookup     — REAL (Vanna + sql_scope.py RBAC injection)
-  graph_lookup   — REAL (intent classification + pre-written Cypher templates, never LLM-written Cypher)
-  quickml        — REAL (Zoho Catalyst QuickML, 4 models, confirmed working with {"data": {...}} payload wrapper)
-  bhashini       — STUB (Kannada STT/TTS, not yet implemented)
+  sql_lookup     — REAL (Vanna + sql_scope.py RBAC injection, Groq via vanna_client.py)
+  graph_lookup   — REAL (intent classification + pre-written Cypher templates, never LLM-written Cypher) — Groq
+  quickml        — REAL (Zoho Catalyst QuickML, 4 models, Production environment, retry-with-backoff) — Groq for intent classification
+  bhashini       — REAL (Sarvam AI: Mayura text translate + Bulbul v3 TTS) — unchanged, not LLM-provider-dependent
   general_answer — REAL (plain Groq call, no DB access)
 """
 
 import json
+import os
+import time
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
 
 from django.db import connection
 
 from langchain_groq import ChatGroq
 from langchain_core.tools import tool
 from groq import Groq
+
+load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 
 from assistant.ai.vanna_client import get_vanna
 from assistant.ai.sql_scope import validate_and_scope, UnsafeQueryError
@@ -33,7 +40,12 @@ from assistant.models import PredictionHistory
 from accounts.permissions import filter_by_station_field
 from persons.models import Person
 from investigations.models import InvestigationCase
-
+from django.conf import settings
+from assistant.ai.sarvam_client import (
+    translate_kannada_text_to_english,
+    translate_english_to_kannada_text,
+    synthesize_kannada_speech,
+)
 
 @dataclass
 class ToolResult:
@@ -52,7 +64,10 @@ class ToolResult:
 # ---------------------------------------------------------------------
 
 MAX_ROWS_RETURNED = 20
+MAX_INTERMEDIATE_STEPS = 3
 
+
+_SQL_START_RE = re.compile(r'^\s*(--.*\n\s*)?(SELECT|WITH)\b', re.IGNORECASE)
 
 def _format_results(columns, rows) -> str:
     if not rows:
@@ -65,6 +80,23 @@ def _format_results(columns, rows) -> str:
     if len(rows) > MAX_ROWS_RETURNED:
         lines.append(f"... and {len(rows) - MAX_ROWS_RETURNED} more row(s)")
     return "\n".join(lines)
+
+
+def _looks_like_sql(text: str) -> bool:
+    return bool(text) and bool(_SQL_START_RE.match(text))
+
+
+def _run_scoped(sql: str, officer):
+    """Runs any SELECT through the same RBAC scoping + read-only path.
+    Raises UnsafeQueryError (RBAC rejection) or lets DB exceptions propagate."""
+    scoped_sql = validate_and_scope(sql, officer)
+    with connection.cursor() as cursor:
+        cursor.execute("SET TRANSACTION READ ONLY")
+        cursor.execute(scoped_sql)
+        columns = [col[0] for col in cursor.description] if cursor.description else []
+        rows = cursor.fetchall() if cursor.description else []
+    return scoped_sql, columns, rows
+
 
 
 def make_sql_lookup_tool(officer, trace_sink: list):
@@ -82,17 +114,37 @@ def make_sql_lookup_tool(officer, trace_sink: list):
         except Exception as exc:
             return f"Couldn't generate a query for that question: {exc}"
 
-        try:
-            scoped_sql = validate_and_scope(generated_sql, officer)
-        except UnsafeQueryError as exc:
-            return f"That question couldn't be safely scoped to your access level ({exc}). Try rephrasing it."
+        current_question = question
+        for _ in range(MAX_INTERMEDIATE_STEPS):
+            if not _looks_like_sql(generated_sql):
+                return generated_sql or "I couldn't generate a query for that question."
+
+            if 'intermediate_sql' not in generated_sql.lower():
+                break
+
+            intermediate_query = re.sub(
+                r'^\s*--.*intermediate_sql.*\n', '', generated_sql, flags=re.IGNORECASE
+            ).strip()
+            try:
+                _, _, intermediate_rows = _run_scoped(intermediate_query, officer)
+            except UnsafeQueryError as exc:
+                return f"That question couldn't be safely scoped to your access level ({exc}). Try rephrasing it."
+            except Exception as exc:
+                return f"Couldn't resolve the values needed for that question: {exc}"
+
+            distinct_values = ", ".join(str(row[0]) for row in intermediate_rows[:50])
+            current_question = f"{current_question}\n\n(Known column values: {distinct_values})"
+            try:
+                generated_sql = vn.generate_sql(current_question, allow_llm_to_see_data=False)
+            except Exception as exc:
+                return f"Couldn't generate a query for that question: {exc}"
+        else:
+            return "Couldn't resolve that question after checking the relevant column values. Try rephrasing it more specifically."
 
         try:
-            with connection.cursor() as cursor:
-                cursor.execute("SET TRANSACTION READ ONLY")
-                cursor.execute(scoped_sql)
-                columns = [col[0] for col in cursor.description] if cursor.description else []
-                rows = cursor.fetchall() if cursor.description else []
+            scoped_sql, columns, rows = _run_scoped(generated_sql, officer)
+        except UnsafeQueryError as exc:
+            return f"That question couldn't be safely scoped to your access level ({exc}). Try rephrasing it."
         except Exception as exc:
             return f"That query failed to run: {exc}"
 
@@ -105,7 +157,6 @@ def make_sql_lookup_tool(officer, trace_sink: list):
         return summary
 
     return sql_lookup
-
 
 # ---------------------------------------------------------------------
 # graph_lookup — REAL
@@ -260,10 +311,19 @@ _DEFAULTS = {
     "weapon_used": False, "victim_count": 1, "property_damage": 0, "hour": 12,
     "evidence_count": 1, "witness_count": 0, "suspect_identified": False,
     "cctv_available": False, "response_time": 20, "investigation_days": 5,
+    "crime_type": "Robbery",
+    "district": "Bengaluru Urban",
+    "severity": "Medium",
+    "police_station": "Cubbon Park PS",
+    "crime_category": "Robbery",
+    "day_of_week": "Monday",
+    "month": 7,
+    "latitude": 12.9716,
+    "longitude": 77.5946,
 }
 
 
-def make_quickml_tool(officer):
+def make_quickml_tool(officer, trace_sink: list):
     groq_client = Groq()
 
     @tool
@@ -298,10 +358,22 @@ def make_quickml_tool(officer):
         features = {k: (v if v is not None else _DEFAULTS.get(k)) for k, v in parsed.get("features", {}).items()}
         used_defaults = [k for k, v in parsed.get("features", {}).items() if v is None and k in _DEFAULTS]
 
-        try:
-            result = quickml_predict(model_key, features)
-        except Exception as exc:
-            return f"Prediction request failed: {exc}"
+        result = None
+        last_exc = None
+        for attempt in range(5):  # widened — Zoho can stay flaky for several seconds
+            try:
+                result = quickml_predict(model_key, features)
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 4:
+                    time.sleep(2 * (attempt + 1))  # 2s, 4s, 6s, 8s
+
+        if result is None:
+            return (
+                f"The prediction service is temporarily unavailable after "
+                f"5 attempts ({last_exc}). Please try again in a moment."
+            )
 
         classification = result.get("result")
         likelihood = result.get("likelihood_score")
@@ -310,31 +382,22 @@ def make_quickml_tool(officer):
         if isinstance(likelihood, list):
             likelihood = round(likelihood[0] * 100, 1) if likelihood else "?"
 
-        # Explainability: Catalyst returns a SHAP-style per-feature impact
-        # score in explanation.data — [feature_name, feature_value, impact].
-        # Positive impact pushed toward the predicted label, negative
-        # pushed away. This was being silently discarded before; now
-        # surfaced as the top 3 contributing factors so the officer sees
-        # WHY the model said what it said, not just the label.
-        #
-        # Caveat, stated plainly rather than hidden: one-hot-encoded
-        # categorical features (e.g. "crime_type_6") don't map back to a
-        # human-readable category name without the model's original
-        # encoding table, which isn't available here — those show up
-        # as-is rather than translated, and that's flagged in the output
-        # itself when it happens, not silently presented as if it were
-        # a clean answer.
         explanation_summary = ""
+        top_factors = []
         explanation_rows = result.get("explanation", {}).get("data", [])
         if explanation_rows:
-            top_factors = sorted(explanation_rows, key=lambda row: abs(row[2]), reverse=True)[:3]
+            top_rows = sorted(explanation_rows, key=lambda row: abs(row[2]), reverse=True)[:3]
             factor_lines = []
             encoded_feature_seen = False
-            for name, value, impact in top_factors:
+            for name, value, impact in top_rows:
                 direction = "supports" if impact > 0 else "against"
-                if any(name.endswith(f"_{i}") for i in range(1, 20)) and name.split("_")[-1].isdigit():
+                is_encoded = any(name.endswith(f"_{i}") for i in range(1, 20)) and name.split("_")[-1].isdigit()
+                if is_encoded:
                     encoded_feature_seen = True
                 factor_lines.append(f"{name}={value} ({direction} {classification}, impact {impact:+.3f})")
+                top_factors.append({
+                    "feature": name, "value": value, "impact": impact, "encoded": is_encoded,
+                })
             explanation_summary = "\nTop contributing factors: " + "; ".join(factor_lines)
             if encoded_feature_seen:
                 explanation_summary += (
@@ -348,13 +411,23 @@ def make_quickml_tool(officer):
             "solvability": PredictionHistory.PredictionType.RISK_SCORE,
             "priority": PredictionHistory.PredictionType.RISK_SCORE,
         }
-        PredictionHistory.objects.create(
+        prediction_record = PredictionHistory.objects.create(
             officer=officer,
             prediction_type=prediction_type_map[model_key],
             input_parameters=features,
             output_result=result,
             confidence_score=(likelihood / 100 if isinstance(likelihood, (int, float)) else None),
         )
+
+        trace_sink.append({
+            "tool": "quickml",
+            "model": model_key,
+            "prediction": classification,
+            "confidence": likelihood,
+            "top_factors": top_factors,
+            "used_defaults": used_defaults,
+            "prediction_history_id": str(prediction_record.id),
+        })
 
         caveat = f" (defaults used for: {', '.join(used_defaults)})" if used_defaults else ""
         return (
@@ -365,26 +438,54 @@ def make_quickml_tool(officer):
 
     return quickml
 
-
 # ---------------------------------------------------------------------
-# bhashini — STUB
+# bhashini — REAL (Sarvam AI)
 # ---------------------------------------------------------------------
 
 def make_bhashini_tool(officer):
-    """STUB — Kannada STT/TTS via Bhashini API."""
+    """Kannada <-> English via Sarvam AI (Mayura text translate,
+    Bulbul v3 TTS). Named bhashini for backward compatibility with the
+    orchestrator's tool list. NOTE: speech-to-text is NOT handled here —
+    audio is transcribed to English before the agent runs (see
+    transcribe_speech_to_english() called from views.py's send-message
+    action), so this tool only ever receives text."""
+
     @tool
     def bhashini(text_or_audio_ref: str) -> str:
-        """Translate or transcribe between Kannada and English — use
-        this when the officer is speaking/writing in Kannada and needs
-        it converted before another tool can act on it, or when a
-        response needs to go back to them in Kannada."""
-        return (
-            "[bhashini_tool is not implemented yet — this is a stub. "
-            "Wire this up to the Bhashini API for Kannada STT/TTS.]"
+        """Translate between Kannada and English, or speak a response in
+        Kannada. Input routing:
+        - Text containing Kannada script is translated to English.
+        - Text prefixed with "text:" is translated to Kannada TEXT.
+        - Plain English text (no prefix) is converted to spoken Kannada
+        audio by default.
+        """
+        is_kannada_script = any(
+            '\u0C80' <= ch <= '\u0CFF' for ch in text_or_audio_ref
         )
 
-    return bhashini
+        if is_kannada_script:
+            try:
+                english_text = translate_kannada_text_to_english(text_or_audio_ref)
+            except Exception as exc:
+                return f"Couldn't translate that text: {exc}"
+            return f"Translated (Kannada -> English): {english_text}"
 
+        if text_or_audio_ref.startswith("text:"):
+            english_source = text_or_audio_ref[len("text:"):].strip()
+            try:
+                kannada_text = translate_english_to_kannada_text(english_source)
+            except Exception as exc:
+                return f"Couldn't translate that text: {exc}"
+            return f"Kannada text: {kannada_text}"
+
+        try:
+            audio_relpath = synthesize_kannada_speech(text_or_audio_ref, settings.MEDIA_ROOT)
+        except Exception as exc:
+            return f"Couldn't generate Kannada speech: {exc}"
+        audio_url = settings.MEDIA_URL + audio_relpath
+        return f"Kannada audio response generated: {audio_url}"
+
+    return bhashini
 
 # ---------------------------------------------------------------------
 # general_answer — REAL
